@@ -1,3 +1,13 @@
+//! Symmetric encryption: AES-256-GCM and ChaCha20-Poly1305.
+//!
+//! Provides multiple layers of abstraction:
+//! - **Legacy API** ([`encrypt`]/[`decrypt`]): AES-256-GCM, format `nonce(12) || ciphertext`.
+//! - **Cipher-agnostic API** ([`seal`]/[`open`]): auto-detected cipher via tag byte.
+//! - **AAD variants** ([`seal_aad`]/[`open_aad`]): bind ciphertext to external context.
+//! - **Streaming** ([`StreamSealer`]/[`StreamOpener`]): chunk-based encryption for large data.
+//! - **Envelope encryption** ([`envelope_seal`]/[`envelope_open`]): DEK/KEK pattern with key rotation.
+//! - **Versioned** ([`versioned_seal`]/[`versioned_open`]): format-version prefix for future upgrades.
+
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, Payload},
     Aes256Gcm, AeadCore, Nonce,
@@ -7,6 +17,7 @@ use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+/// Errors returned by encryption and decryption operations.
 #[derive(Debug, Error)]
 pub enum EncryptError {
     #[error("encryption failed")]
@@ -23,6 +34,7 @@ pub enum EncryptError {
     UnsupportedVersion(u8),
 }
 
+/// Supported AEAD ciphers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cipher {
     Aes256Gcm,
@@ -35,12 +47,16 @@ const TAG_CHACHA: u8 = 0x02;
 const NONCE_PREFIX_LEN: usize = 8;
 const STREAM_HEADER_LEN: usize = 1 + NONCE_PREFIX_LEN;
 
-// format version — prepended by versioned_seal/versioned_open.
-// allows future format changes without breaking old data.
+// Format version prepended by versioned_seal/versioned_open.
 const FORMAT_VERSION: u8 = 0x01;
 
+// ---------------------------------------------------------------------------
 // Legacy API — AES-256-GCM only, format: nonce(12) || ciphertext
+// ---------------------------------------------------------------------------
 
+/// Encrypts `plaintext` with AES-256-GCM.
+///
+/// Output format: `nonce(12) || ciphertext+tag`.
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| EncryptError::Encrypt)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -54,6 +70,7 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, EncryptError
     Ok(output)
 }
 
+/// Decrypts data produced by [`encrypt`] (AES-256-GCM).
 pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
     if data.len() < NONCE_LEN {
         return Err(EncryptError::TooShort);
@@ -66,20 +83,31 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
         .map_err(|_| EncryptError::Decrypt)
 }
 
-// seal/open — cipher selection, format: tag(1) || nonce(12) || ciphertext
-// open() detects cipher from the first byte
+// ---------------------------------------------------------------------------
+// Cipher-agnostic API — format: tag(1) || nonce(12) || ciphertext
+// ---------------------------------------------------------------------------
 
+/// Encrypts `plaintext` with the chosen cipher. The cipher is recorded as a tag byte.
+///
+/// Output format: `tag(1) || nonce(12) || ciphertext+tag`.
 pub fn seal(key: &[u8; 32], plaintext: &[u8], cipher: Cipher) -> Result<Vec<u8>, EncryptError> {
     seal_aad(key, plaintext, &[], cipher)
 }
 
+/// Decrypts data produced by [`seal`], auto-detecting the cipher from the tag byte.
 pub fn open(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
     open_aad(key, data, &[])
 }
 
+// ---------------------------------------------------------------------------
 // AAD variants — bind ciphertext to metadata (file_id, version, etc.)
-// without AAD the ciphertext can be moved from one context to another
+// ---------------------------------------------------------------------------
 
+/// Encrypts `plaintext` with additional authenticated data (AAD).
+///
+/// AAD is authenticated but not encrypted — use it to bind ciphertext
+/// to external context (file ID, version, etc.) so it cannot be moved
+/// to a different context.
 pub fn seal_aad(
     key: &[u8; 32],
     plaintext: &[u8],
@@ -116,6 +144,7 @@ pub fn seal_aad(
     }
 }
 
+/// Decrypts data produced by [`seal_aad`], verifying the AAD.
 pub fn open_aad(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>, EncryptError> {
     if data.len() < 1 + NONCE_LEN {
         return Err(EncryptError::TooShort);
@@ -146,10 +175,18 @@ pub fn open_aad(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>, Encr
     }
 }
 
-// Streaming encryption — for files that don't fit in memory.
-// Each chunk is encrypted with a separate nonce = prefix(8 random) || counter(4 BE).
-// Header: tag(1) || nonce_prefix(8). Caller is responsible for chunk framing.
+// ---------------------------------------------------------------------------
+// Streaming encryption — for data that doesn't fit in memory
+// ---------------------------------------------------------------------------
 
+/// Streaming encryptor for large data.
+///
+/// Each chunk gets a unique nonce: `prefix(8 random) || counter(4 BE)`.
+/// The caller is responsible for chunk framing (length-prefixing, etc.).
+///
+/// # Wire format
+///
+/// Header: `tag(1) || nonce_prefix(8)`, followed by encrypted chunks.
 pub struct StreamSealer {
     key: [u8; 32],
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
@@ -158,7 +195,9 @@ pub struct StreamSealer {
 }
 
 impl StreamSealer {
-    // returns (sealer, header_bytes) — header must be written first
+    /// Creates a new streaming sealer, returning `(sealer, header_bytes)`.
+    ///
+    /// The 9-byte header must be written to the output before any chunks.
     pub fn new(key: &[u8; 32], cipher: Cipher) -> (Self, Vec<u8>) {
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce_prefix);
@@ -183,7 +222,7 @@ impl StreamSealer {
         )
     }
 
-    // encrypts one chunk, output = ciphertext + 16 bytes AEAD tag
+    /// Encrypts one chunk. Output includes the 16-byte AEAD tag.
     pub fn seal_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         let nonce = self.next_nonce()?;
         let nonce_ref = Nonce::from_slice(&nonce);
@@ -222,6 +261,7 @@ impl Drop for StreamSealer {
     }
 }
 
+/// Streaming decryptor — counterpart to [`StreamSealer`].
 pub struct StreamOpener {
     key: [u8; 32],
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
@@ -230,7 +270,7 @@ pub struct StreamOpener {
 }
 
 impl StreamOpener {
-    // parses header (9 bytes), determines cipher and nonce prefix
+    /// Creates a new streaming opener by parsing the 9-byte header.
     pub fn new(key: &[u8; 32], header: &[u8]) -> Result<Self, EncryptError> {
         if header.len() < STREAM_HEADER_LEN {
             return Err(EncryptError::InvalidHeader);
@@ -251,6 +291,7 @@ impl StreamOpener {
         })
     }
 
+    /// Decrypts one chunk produced by [`StreamSealer::seal_chunk`].
     pub fn open_chunk(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         let nonce = self.next_nonce()?;
         let nonce_ref = Nonce::from_slice(&nonce);
@@ -289,11 +330,14 @@ impl Drop for StreamOpener {
     }
 }
 
-// Envelope encryption (DEK/KEK pattern).
-// Generate random DEK, encrypt data with it, wrap DEK with KEK.
-// Format: wrapped_dek_len(4 LE) || wrapped_dek || encrypted_data
-// The wrapped DEK includes AAD binding it to the encrypted payload (BLAKE3 hash of ciphertext).
+// ---------------------------------------------------------------------------
+// Envelope encryption (DEK/KEK pattern)
+// ---------------------------------------------------------------------------
 
+/// Encrypts `plaintext` using envelope encryption (random DEK wrapped by KEK).
+///
+/// Output format: `wrapped_dek_len(4 LE) || wrapped_dek || encrypted_data`.
+/// The wrapped DEK is bound to the encrypted payload via a BLAKE3 hash.
 pub fn envelope_seal(
     kek: &[u8; 32],
     plaintext: &[u8],
@@ -302,10 +346,15 @@ pub fn envelope_seal(
     envelope_seal_aad(kek, plaintext, &[], cipher)
 }
 
+/// Decrypts data produced by [`envelope_seal`].
 pub fn envelope_open(kek: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
     envelope_open_aad(kek, data, &[])
 }
 
+/// Encrypts `plaintext` using envelope encryption with AAD.
+///
+/// The DEK is bound to the ciphertext via `BLAKE3(encrypted_data)`,
+/// preventing the wrapped DEK from being paired with different data.
 pub fn envelope_seal_aad(
     kek: &[u8; 32],
     plaintext: &[u8],
@@ -319,13 +368,13 @@ pub fn envelope_seal_aad(
     // 2. encrypt data with DEK
     let encrypted_data = seal_aad(&dek, plaintext, aad, cipher)?;
 
-    // 3. wrap DEK with KEK — AAD = blake3(encrypted_data) to bind them together
+    // 3. wrap DEK with KEK — AAD = blake3(encrypted_data) to bind them
     let binding = blake3::hash(&encrypted_data);
     let wrapped_dek = seal_aad(kek, &dek, binding.as_bytes(), cipher)?;
 
     dek.zeroize();
 
-    // 4. assemble: wrapped_dek_len(4 LE) || wrapped_dek || encrypted_data
+    // 4. assemble
     let wdk_len = (wrapped_dek.len() as u32).to_le_bytes();
     let mut out = Vec::with_capacity(4 + wrapped_dek.len() + encrypted_data.len());
     out.extend_from_slice(&wdk_len);
@@ -334,6 +383,7 @@ pub fn envelope_seal_aad(
     Ok(out)
 }
 
+/// Decrypts data produced by [`envelope_seal_aad`], verifying AAD.
 pub fn envelope_open_aad(
     kek: &[u8; 32],
     data: &[u8],
@@ -343,7 +393,6 @@ pub fn envelope_open_aad(
         return Err(EncryptError::TooShort);
     }
 
-    // 1. parse wrapped_dek_len
     let wdk_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if data.len() < 4 + wdk_len {
         return Err(EncryptError::TooShort);
@@ -352,7 +401,7 @@ pub fn envelope_open_aad(
     let wrapped_dek = &data[4..4 + wdk_len];
     let encrypted_data = &data[4 + wdk_len..];
 
-    // 2. unwrap DEK — AAD = blake3(encrypted_data) verifies binding
+    // unwrap DEK — AAD = blake3(encrypted_data) verifies binding
     let binding = blake3::hash(encrypted_data);
     let dek_bytes = open_aad(kek, wrapped_dek, binding.as_bytes())?;
 
@@ -362,16 +411,20 @@ pub fn envelope_open_aad(
     let mut dek = [0u8; 32];
     dek.copy_from_slice(&dek_bytes);
 
-    // 3. decrypt data with DEK
     let plaintext = open_aad(&dek, encrypted_data, aad)?;
 
     dek.zeroize();
     Ok(plaintext)
 }
 
-// Key rotation — re-wraps the DEK with a new KEK without touching the data.
-// Only the wrapped-DEK portion changes; the encrypted payload stays identical.
+// ---------------------------------------------------------------------------
+// Key rotation — re-wraps the DEK without touching the data
+// ---------------------------------------------------------------------------
 
+/// Re-wraps the DEK in an envelope with a new KEK.
+///
+/// Only the wrapped-DEK portion changes; the encrypted payload stays identical.
+/// This is an O(1) operation regardless of data size.
 pub fn envelope_rotate(
     old_kek: &[u8; 32],
     new_kek: &[u8; 32],
@@ -380,6 +433,7 @@ pub fn envelope_rotate(
     envelope_rotate_aad(old_kek, new_kek, data, &[])
 }
 
+/// Re-wraps the DEK with a new KEK, preserving AAD binding.
 pub fn envelope_rotate_aad(
     old_kek: &[u8; 32],
     new_kek: &[u8; 32],
@@ -398,7 +452,7 @@ pub fn envelope_rotate_aad(
     let wrapped_dek = &data[4..4 + wdk_len];
     let encrypted_data = &data[4 + wdk_len..];
 
-    // unwrap DEK with old KEK (binding = blake3 of encrypted payload)
+    // unwrap DEK with old KEK
     let binding = blake3::hash(encrypted_data);
     let mut dek_bytes = open_aad(old_kek, wrapped_dek, binding.as_bytes())?;
 
@@ -422,10 +476,13 @@ pub fn envelope_rotate_aad(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
 // Versioned seal/open — format: version(1) || seal_payload
-// Allows future format upgrades while keeping old data readable.
-// Current version: 0x01
+// ---------------------------------------------------------------------------
 
+/// Encrypts with a format-version prefix for future upgrades.
+///
+/// Current version: `0x01`. Output: `version(1) || seal_payload`.
 pub fn versioned_seal(
     key: &[u8; 32],
     plaintext: &[u8],
@@ -434,10 +491,12 @@ pub fn versioned_seal(
     versioned_seal_aad(key, plaintext, &[], cipher)
 }
 
+/// Decrypts data produced by [`versioned_seal`].
 pub fn versioned_open(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
     versioned_open_aad(key, data, &[])
 }
 
+/// Encrypts with a format-version prefix and AAD.
 pub fn versioned_seal_aad(
     key: &[u8; 32],
     plaintext: &[u8],
@@ -451,6 +510,7 @@ pub fn versioned_seal_aad(
     Ok(out)
 }
 
+/// Decrypts data produced by [`versioned_seal_aad`].
 pub fn versioned_open_aad(
     key: &[u8; 32],
     data: &[u8],

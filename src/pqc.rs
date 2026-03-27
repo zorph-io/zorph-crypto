@@ -1,7 +1,12 @@
-// Hybrid PQC cryptography: classical + post-quantum simultaneously.
-// Signatures: Ed25519 + ML-DSA-65 — forging requires breaking both.
-// Key exchange: X25519 + ML-KEM-768 — same idea.
-// SLH-DSA (SPHINCS+): conservative hash-based signatures (FIPS 205).
+//! Hybrid post-quantum cryptography.
+//!
+//! All operations combine a classical and a post-quantum algorithm simultaneously —
+//! an attacker must break **both** to compromise security.
+//!
+//! - **Signatures:** Ed25519 + ML-DSA-65 (FIPS 204).
+//! - **Key exchange:** X25519 + ML-KEM-768 (FIPS 203).
+//! - **Hash-based signatures:** SLH-DSA / SPHINCS+ (FIPS 205) — the most conservative
+//!   PQC option, relying only on hash function strength. Trade-off: ~17 KB signatures.
 
 use ed25519_dalek::{
     Signer as Ed25519Signer, Verifier as Ed25519Verifier,
@@ -23,12 +28,15 @@ use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use zeroize::Zeroize;
 
-// PQC crates use rand_core 0.10 (via getrandom),
-// classical ones use rand_core 0.6 (via rand). Two different RNG worlds.
+/// Returns a `rand_core 0.10` RNG backed by `getrandom::SysRng`.
+///
+/// PQC crates use `rand_core 0.10` (via `getrandom`),
+/// while classical crates use `rand_core 0.6` (via `rand`).
 fn pqc_rng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
     getrandom::rand_core::UnwrapErr(getrandom::SysRng)
 }
 
+/// Errors returned by hybrid PQC operations.
 #[derive(Debug, Error)]
 pub enum PqcError {
     #[error("hybrid signature verification failed")]
@@ -39,16 +47,20 @@ pub enum PqcError {
     Deserialize(String),
 }
 
-// Ed25519 + ML-DSA-65
+// ===========================================================================
+// Hybrid signatures: Ed25519 + ML-DSA-65
+// ===========================================================================
 
+/// Combined Ed25519 + ML-DSA-65 signing key.
 pub struct HybridSigningKey {
     pub classical: Ed25519SigningKey,
     pub pqc: ml_dsa::SigningKey<MlDsa65>,
 }
 
 impl HybridSigningKey {
-    // compact serialization: ed25519_seed(32) + mldsa_seed(32) = 64 bytes
-    // instead of the full key (~4KB)
+    /// Serializes as `ed25519_seed(32) || mldsa_seed(32)` = 64 bytes.
+    ///
+    /// Uses seeds instead of expanded keys (~4 KB) for compact storage.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&self.classical.to_bytes());
@@ -56,6 +68,7 @@ impl HybridSigningKey {
         out
     }
 
+    /// Deserializes from 64 bytes (`ed25519_seed || mldsa_seed`).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         if bytes.len() != 64 {
             return Err(PqcError::Deserialize(format!(
@@ -90,13 +103,14 @@ impl<'de> Deserialize<'de> for HybridSigningKey {
     }
 }
 
+/// Combined Ed25519 + ML-DSA-65 verifying key.
 pub struct HybridVerifyingKey {
     pub classical: Ed25519VerifyingKey,
     pub pqc: ml_dsa::VerifyingKey<MlDsa65>,
 }
 
 impl HybridVerifyingKey {
-    // ed25519_vk(32) + mldsa_vk(encoded)
+    /// Serializes as `ed25519_vk(32) || mldsa_vk(encoded)`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let pqc_encoded = self.pqc.encode();
         let pqc_bytes: &[u8] = pqc_encoded.as_ref();
@@ -106,6 +120,7 @@ impl HybridVerifyingKey {
         out
     }
 
+    /// Deserializes from `ed25519_vk(32) || mldsa_vk(variable)`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         if bytes.len() < 33 {
             return Err(PqcError::Deserialize("HybridVerifyingKey: too short".into()));
@@ -139,13 +154,14 @@ impl<'de> Deserialize<'de> for HybridVerifyingKey {
     }
 }
 
+/// Combined Ed25519 + ML-DSA-65 signature.
 pub struct HybridSignature {
     pub classical: Ed25519Signature,
     pub pqc: ml_dsa::Signature<MlDsa65>,
 }
 
 impl HybridSignature {
-    // ed25519_sig(64) + mldsa_sig(encoded)
+    /// Serializes as `ed25519_sig(64) || mldsa_sig(encoded)`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let pqc_encoded = self.pqc.encode();
         let pqc_bytes: &[u8] = pqc_encoded.as_ref();
@@ -155,6 +171,7 @@ impl HybridSignature {
         out
     }
 
+    /// Deserializes from `ed25519_sig(64) || mldsa_sig(variable)`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         if bytes.len() < 65 {
             return Err(PqcError::Deserialize("HybridSignature: too short".into()));
@@ -184,12 +201,11 @@ impl<'de> Deserialize<'de> for HybridSignature {
     }
 }
 
+/// Generates a hybrid Ed25519 + ML-DSA-65 signing/verifying keypair.
 pub fn generate_signing_keypair() -> (HybridSigningKey, HybridVerifyingKey) {
-    // Ed25519 — rand 0.8 OsRng
     let classical = Ed25519SigningKey::generate(&mut OsRng);
     let classical_vk = classical.verifying_key();
 
-    // ML-DSA — rand_core 0.10 via getrandom
     let mut rng = pqc_rng();
     let pqc_sk = MlDsa65::key_gen(&mut rng);
     let pqc_vk = pqc_sk.verifying_key().clone();
@@ -206,7 +222,9 @@ pub fn generate_signing_keypair() -> (HybridSigningKey, HybridVerifyingKey) {
     )
 }
 
-// both signatures must pass — if either one is invalid, the whole thing is rejected
+/// Signs `message` with both Ed25519 and ML-DSA-65.
+///
+/// Both signatures must pass verification — if either is invalid, the whole thing is rejected.
 pub fn hybrid_sign(key: &HybridSigningKey, message: &[u8]) -> Result<HybridSignature, PqcError> {
     let classical = key.classical.sign(message);
     let pqc = key
@@ -217,6 +235,9 @@ pub fn hybrid_sign(key: &HybridSigningKey, message: &[u8]) -> Result<HybridSigna
     Ok(HybridSignature { classical, pqc })
 }
 
+/// Verifies both the Ed25519 and ML-DSA-65 signatures.
+///
+/// Fails if either signature is invalid.
 pub fn hybrid_verify(
     key: &HybridVerifyingKey,
     message: &[u8],
@@ -231,18 +252,25 @@ pub fn hybrid_verify(
     Ok(())
 }
 
-// X25519 + ML-KEM-768
+// ===========================================================================
+// Hybrid key exchange: X25519 + ML-KEM-768
+// ===========================================================================
 
-// 32 bytes X25519 + 32 bytes ML-KEM, combined via BLAKE3 -> one 32-byte key
+/// Combined shared secret from X25519 (32 bytes) and ML-KEM-768 (32 bytes).
+///
+/// Call [`derive_key`](Self::derive_key) to combine both halves into a single
+/// 32-byte key via BLAKE3 KDF.
 pub struct HybridSharedSecret {
     data: [u8; 64],
 }
 
 impl HybridSharedSecret {
+    /// Returns the raw 64-byte combined secret (X25519 || ML-KEM).
     pub fn as_bytes(&self) -> &[u8; 64] {
         &self.data
     }
 
+    /// Derives a single 32-byte key from both halves via BLAKE3 KDF.
     pub fn derive_key(&self) -> [u8; 32] {
         blake3::derive_key("zorph-crypto hybrid-shared-secret v1", &self.data)
     }
@@ -254,13 +282,16 @@ impl Drop for HybridSharedSecret {
     }
 }
 
+/// Message sent from the initiator to the responder during hybrid key exchange.
 pub struct HybridExchangeMessage {
+    /// Initiator's ephemeral X25519 public key.
     pub x25519_public: X25519PublicKey,
+    /// ML-KEM-768 ciphertext encapsulating the PQC shared secret.
     pub mlkem_ciphertext: ml_kem::Ciphertext<MlKem768>,
 }
 
 impl HybridExchangeMessage {
-    // x25519_pk(32) + mlkem_ct(variable)
+    /// Serializes as `x25519_pk(32) || mlkem_ciphertext(variable)`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let ct_bytes: &[u8] = self.mlkem_ciphertext.as_ref();
         let mut out = Vec::with_capacity(32 + ct_bytes.len());
@@ -269,6 +300,7 @@ impl HybridExchangeMessage {
         out
     }
 
+    /// Deserializes from `x25519_pk(32) || mlkem_ciphertext`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         if bytes.len() < 33 {
             return Err(PqcError::Deserialize(
@@ -304,7 +336,9 @@ impl<'de> Deserialize<'de> for HybridExchangeMessage {
     }
 }
 
-// EphemeralSecret is non-serializable by design — generate a fresh one per exchange
+/// Ephemeral hybrid keypair for key exchange.
+///
+/// [`EphemeralSecret`] is non-serializable by design — generate a fresh one per exchange.
 pub struct HybridExchangeKeypair {
     pub x25519_secret: EphemeralSecret,
     pub x25519_public: X25519PublicKey,
@@ -312,6 +346,7 @@ pub struct HybridExchangeKeypair {
     pub mlkem_ek: ml_kem::EncapsulationKey<MlKem768>,
 }
 
+/// Serializable public half of a [`HybridExchangeKeypair`].
 #[derive(Serialize, Deserialize)]
 pub struct HybridExchangePublicKey {
     x25519: [u8; 32],
@@ -319,6 +354,7 @@ pub struct HybridExchangePublicKey {
 }
 
 impl HybridExchangeKeypair {
+    /// Extracts the serializable public key.
     pub fn public_key(&self) -> HybridExchangePublicKey {
         let ek_bytes = self.mlkem_ek.to_bytes();
         let mlkem_bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&ek_bytes).to_vec();
@@ -330,10 +366,12 @@ impl HybridExchangeKeypair {
 }
 
 impl HybridExchangePublicKey {
+    /// Returns the X25519 public key.
     pub fn x25519(&self) -> X25519PublicKey {
         X25519PublicKey::from(self.x25519)
     }
 
+    /// Parses the ML-KEM-768 encapsulation key.
     pub fn mlkem(&self) -> Result<ml_kem::EncapsulationKey<MlKem768>, PqcError> {
         let key_bytes = self
             .mlkem
@@ -345,6 +383,7 @@ impl HybridExchangePublicKey {
     }
 }
 
+/// Generates an ephemeral hybrid X25519 + ML-KEM-768 keypair.
 pub fn generate_exchange_keypair() -> HybridExchangeKeypair {
     let x25519_secret = EphemeralSecret::random_from_rng(OsRng);
     let x25519_public = X25519PublicKey::from(&x25519_secret);
@@ -360,7 +399,10 @@ pub fn generate_exchange_keypair() -> HybridExchangeKeypair {
     }
 }
 
-// initiator: creates a message for the responder + own shared secret
+/// Initiates a hybrid key exchange.
+///
+/// Performs X25519 DH and ML-KEM encapsulation against the responder's public keys,
+/// returning the exchange message (to send) and the derived shared secret.
 pub fn hybrid_exchange_initiate(
     their_x25519: &X25519PublicKey,
     their_mlkem: &ml_kem::EncapsulationKey<MlKem768>,
@@ -386,7 +428,9 @@ pub fn hybrid_exchange_initiate(
     )
 }
 
-// responder: derives the same shared secret from the initiator's message
+/// Completes a hybrid key exchange on the responder side.
+///
+/// Derives the same shared secret from the initiator's exchange message.
 pub fn hybrid_exchange_respond(
     msg: &HybridExchangeMessage,
     x25519_secret: EphemeralSecret,
@@ -403,9 +447,9 @@ pub fn hybrid_exchange_respond(
     HybridSharedSecret { data: combined }
 }
 
+// ===========================================================================
 // SLH-DSA (SPHINCS+) — hash-based signatures, FIPS 205
-// security relies only on hash function strength — the most conservative PQC option
-// tradeoff: large signatures (~17KB), but maximum confidence in quantum resistance
+// ===========================================================================
 
 use slh_dsa::{
     Shake128f as SlhDsaShake128f,
@@ -414,18 +458,25 @@ use slh_dsa::{
     Signature as SlhDsaSignature,
 };
 
+/// SLH-DSA (SPHINCS+) signing key — SHAKE-128f parameter set.
+///
+/// Hash-based signatures whose security relies only on hash function strength.
+/// Most conservative PQC option; trade-off is ~17 KB signatures.
 pub struct StatelessSigningKey {
     inner: SlhDsaSigningKey<SlhDsaShake128f>,
 }
 
+/// SLH-DSA (SPHINCS+) verifying key.
 pub struct StatelessVerifyingKey {
     inner: SlhDsaVerifyingKey<SlhDsaShake128f>,
 }
 
+/// SLH-DSA (SPHINCS+) signature (~17 KB).
 pub struct StatelessSignature {
     inner: SlhDsaSignature<SlhDsaShake128f>,
 }
 
+/// Generates an SLH-DSA signing/verifying keypair.
 pub fn generate_stateless_keypair() -> (StatelessSigningKey, StatelessVerifyingKey) {
     let mut rng = pqc_rng();
     let sk = SlhDsaSigningKey::<SlhDsaShake128f>::new(&mut rng);
@@ -437,6 +488,7 @@ pub fn generate_stateless_keypair() -> (StatelessSigningKey, StatelessVerifyingK
     )
 }
 
+/// Signs `message` with SLH-DSA.
 pub fn stateless_sign(
     key: &StatelessSigningKey,
     message: &[u8],
@@ -448,6 +500,7 @@ pub fn stateless_sign(
     Ok(StatelessSignature { inner: sig })
 }
 
+/// Verifies an SLH-DSA signature.
 pub fn stateless_verify(
     key: &StatelessVerifyingKey,
     message: &[u8],
@@ -459,10 +512,12 @@ pub fn stateless_verify(
 }
 
 impl StatelessSigningKey {
+    /// Serializes the signing key to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_vec()
     }
 
+    /// Deserializes a signing key from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         let inner = SlhDsaSigningKey::<SlhDsaShake128f>::try_from(bytes)
             .map_err(|e| PqcError::Deserialize(format!("SLH-DSA sk: {e}")))?;
@@ -471,10 +526,12 @@ impl StatelessSigningKey {
 }
 
 impl StatelessVerifyingKey {
+    /// Serializes the verifying key to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_vec()
     }
 
+    /// Deserializes a verifying key from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         let inner = SlhDsaVerifyingKey::<SlhDsaShake128f>::try_from(bytes)
             .map_err(|e| PqcError::Deserialize(format!("SLH-DSA vk: {e}")))?;
@@ -483,10 +540,12 @@ impl StatelessVerifyingKey {
 }
 
 impl StatelessSignature {
+    /// Serializes the signature to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_vec()
     }
 
+    /// Deserializes a signature from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqcError> {
         let inner = SlhDsaSignature::<SlhDsaShake128f>::try_from(bytes)
             .map_err(|e| PqcError::Deserialize(format!("SLH-DSA sig: {e}")))?;

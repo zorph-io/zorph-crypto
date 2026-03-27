@@ -1,5 +1,12 @@
+//! Shamir's Secret Sharing.
+//!
+//! Splits a secret into `n` shares with a threshold of `k` — any `k` shares
+//! can reconstruct the original secret, but fewer than `k` reveal nothing.
+//! Operates on arbitrary binary data (hex-encoded internally for the shamir crate).
+
 use thiserror::Error;
 
+/// Errors returned by split and reconstruct operations.
 #[derive(Debug, Error)]
 pub enum SharingError {
     #[error("sharing operation failed: {0}")]
@@ -8,15 +15,18 @@ pub enum SharingError {
     Recovery,
 }
 
+/// A single share of a split secret.
 #[derive(Clone, Debug)]
 pub struct Share {
+    /// 1-based share index.
     pub index: u8,
+    /// Opaque share data.
     pub data: Vec<u8>,
 }
 
-// splits the secret into n shares, any k of them are enough to reconstruct.
-// works with arbitrary binary data — hex-encodes internally so the shamir crate
-// (which requires UTF-8) handles raw keys, ciphertexts, etc.
+/// Splits `secret` into `n` shares with threshold `k`.
+///
+/// Requires `k >= 2` and `n >= k`. The secret must not be empty.
 pub fn split(secret: &[u8], k: u8, n: u8) -> Result<Vec<Share>, SharingError> {
     if secret.is_empty() {
         return Err(SharingError::Operation("secret must not be empty".into()));
@@ -46,6 +56,9 @@ pub fn split(secret: &[u8], k: u8, n: u8) -> Result<Vec<Share>, SharingError> {
     Ok(shares)
 }
 
+/// Reconstructs the original secret from `shares` given the `threshold`.
+///
+/// Returns an error if the shares are insufficient or invalid.
 pub fn reconstruct(shares: &[Share], threshold: u8) -> Result<Vec<u8>, SharingError> {
     let share_vecs: Vec<Vec<u8>> = shares.iter().map(|s| s.data.clone()).collect();
     let hex_secret = shamir::SecretData::recover_secret(threshold, share_vecs)

@@ -1,10 +1,12 @@
-// ZK primitives: commitments, Merkle trees, proof envelope wrapper.
-// Verification lives here (open-source lib), proof generation is in the closed-source code.
-// Proofs are verifiable without contacting Zorph. Even if Zorph disappears.
+//! Zero-knowledge primitives: commitments, Merkle trees, and proof envelopes.
+//!
+//! Verification lives here (open-source); proof generation is in the closed-source enclave code.
+//! All proofs are independently verifiable without contacting Zorph.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Errors returned by ZK operations.
 #[derive(Debug, Error)]
 pub enum ZkError {
     #[error("commitment verification failed")]
@@ -17,20 +19,27 @@ pub enum ZkError {
     InvalidData(String),
 }
 
+// ---------------------------------------------------------------------------
 // Commitments: commit(value) -> (hash, opening), verify(hash, opening) -> ok/err
 // hash = BLAKE3(nonce || value)
+// ---------------------------------------------------------------------------
 
+/// A hiding commitment — the BLAKE3 hash of a nonce-prefixed value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commitment {
     pub hash: [u8; 32],
 }
 
+/// The opening (witness) for a [`Commitment`]: the random nonce and the original value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitmentOpening {
     pub nonce: [u8; 32],
     pub value: Vec<u8>,
 }
 
+/// Creates a new commitment to `value`.
+///
+/// Returns the commitment and the opening needed to reveal it later.
 pub fn commit(value: &[u8]) -> (Commitment, CommitmentOpening) {
     let mut nonce = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -46,6 +55,7 @@ pub fn commit(value: &[u8]) -> (Commitment, CommitmentOpening) {
     )
 }
 
+/// Verifies a commitment against its opening (constant-time comparison).
 pub fn verify_commitment(commitment: &Commitment, opening: &CommitmentOpening) -> Result<(), ZkError> {
     let expected = compute_commitment(&opening.nonce, &opening.value);
     use subtle::ConstantTimeEq;
@@ -60,22 +70,37 @@ fn compute_commitment(nonce: &[u8; 32], value: &[u8]) -> [u8; 32] {
     blake3::keyed_hash(nonce, value).into()
 }
 
-// Merkle tree on BLAKE3
-// proves that a leaf (file hash) belongs to the set without revealing the others
+// ---------------------------------------------------------------------------
+// Merkle tree (BLAKE3)
+// ---------------------------------------------------------------------------
 
+/// A Merkle inclusion proof for a single leaf.
+///
+/// Proves that `leaf` is part of the tree with the given `root`
+/// without revealing any other leaves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleProof {
+    /// The leaf hash being proved.
     pub leaf: [u8; 32],
+    /// Sibling hashes along the path from leaf to root.
     pub path: Vec<MerkleNode>,
+    /// The Merkle root.
     pub root: [u8; 32],
 }
 
+/// A sibling node in a [`MerkleProof`] path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleNode {
+    /// The sibling's hash.
     pub hash: [u8; 32],
+    /// `true` if this sibling is the left child (i.e., the proved node is on the right).
     pub is_left: bool,
 }
 
+/// Computes the Merkle root of the given leaf hashes.
+///
+/// Odd layers duplicate the last leaf to keep the tree balanced.
+/// Returns `[0u8; 32]` for an empty slice.
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
@@ -92,8 +117,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
             if chunk.len() == 2 {
                 next.push(hash_pair(&chunk[0], &chunk[1]));
             } else {
-                // odd leaf — duplicate it so the tree is always balanced.
-                // prevents cross-tree root collisions.
+                // odd leaf — duplicate to keep the tree balanced
                 next.push(hash_pair(&chunk[0], &chunk[0]));
             }
         }
@@ -103,6 +127,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     current[0]
 }
 
+/// Generates a Merkle inclusion proof for the leaf at `index`.
 pub fn merkle_prove(leaves: &[[u8; 32]], index: usize) -> Result<MerkleProof, ZkError> {
     if index >= leaves.len() {
         return Err(ZkError::InvalidData(format!(
@@ -157,6 +182,7 @@ pub fn merkle_prove(leaves: &[[u8; 32]], index: usize) -> Result<MerkleProof, Zk
     })
 }
 
+/// Verifies a Merkle inclusion proof by recomputing the root from the leaf and path.
 pub fn merkle_verify(proof: &MerkleProof) -> Result<(), ZkError> {
     let mut current = proof.leaf;
 
@@ -182,9 +208,11 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-// ProofEnvelope — container for any type of proof
-// signed with the enclave's Ed25519 key (prover_key is verified via SEV-SNP attestation)
+// ---------------------------------------------------------------------------
+// Proof envelope
+// ---------------------------------------------------------------------------
 
+/// The type of proof carried by a [`ProofEnvelope`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProofKind {
     FileIntegrity,
@@ -196,18 +224,32 @@ pub enum ProofKind {
     Enclave,
 }
 
+/// A signed proof container.
+///
+/// Wraps any type of proof with an Ed25519 signature from the enclave's key.
+/// The `prover_key` is verified via SEV-SNP attestation.
+///
+/// Signature covers: `kind(1) || timestamp(8 LE) || statement_hash(32) || proof_data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofEnvelope {
+    /// What this proof attests to.
     pub kind: ProofKind,
+    /// Unix timestamp (seconds) when the proof was created.
     pub timestamp: u64,
+    /// BLAKE3 hash of the statement being proved.
     pub statement_hash: [u8; 32],
+    /// Opaque proof payload (interpretation depends on `kind`).
     pub proof_data: Vec<u8>,
+    /// Ed25519 signature over the canonical message.
     pub signature: Vec<u8>,
+    /// Ed25519 public key of the prover (verified via attestation).
     pub prover_key: [u8; 32],
 }
 
 impl ProofEnvelope {
-    // signature covers: kind || timestamp || statement_hash || proof_data
+    /// Builds the canonical message covered by the signature.
+    ///
+    /// Format: `kind(1) || timestamp(8 LE) || statement_hash(32) || proof_data`.
     pub fn signed_message(&self) -> Vec<u8> {
         let mut msg = Vec::new();
         msg.push(self.kind as u8);
@@ -217,6 +259,7 @@ impl ProofEnvelope {
         msg
     }
 
+    /// Verifies the Ed25519 signature against `prover_key`.
     pub fn verify_signature(&self) -> Result<(), ZkError> {
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 

@@ -1,3 +1,9 @@
+//! Token generation and Ed25519-signed tokens with optional expiry.
+//!
+//! Provides random hex tokens, prefixed API keys (`zrph_`),
+//! and [`SignedToken`] — an Ed25519-signed envelope carrying an arbitrary
+//! payload with constant-time signature and key verification.
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -5,6 +11,7 @@ use thiserror::Error;
 
 use crate::{keys, sign};
 
+/// Errors returned by token operations.
 #[derive(Debug, Error)]
 pub enum TokenError {
     #[error("token expired")]
@@ -17,28 +24,31 @@ pub enum TokenError {
 
 const API_KEY_PREFIX: &str = "zrph_";
 
-/// 32 random bytes → 64 hex chars.
+/// Generates a random 64-character hex token (32 random bytes).
 pub fn generate_token() -> String {
     to_hex(&keys::random_bytes::<32>())
 }
 
-/// Prefixed API key: `zrph_` + 32 random bytes hex.
+/// Generates a prefixed API key: `zrph_` + 64 hex characters.
 pub fn generate_api_key() -> String {
     format!("{API_KEY_PREFIX}{}", to_hex(&keys::random_bytes::<32>()))
 }
 
-/// Ed25519-signed token carrying an arbitrary payload with optional expiry.
+/// An Ed25519-signed token carrying an arbitrary payload with optional expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedToken {
+    /// Arbitrary binary payload.
     pub payload: Vec<u8>,
     /// Unix timestamp (seconds). `0` means no expiry.
     pub expires_at: u64,
+    /// Ed25519 signature (64 bytes).
     pub signature: Vec<u8>,
+    /// Ed25519 verifying key of the signer (32 bytes).
     pub signer_key: Vec<u8>,
 }
 
 impl SignedToken {
-    /// Canonical message that gets signed: `expires_at(8 BE) || payload`.
+    /// Builds the canonical message that gets signed: `expires_at(8 BE) || payload`.
     fn message(payload: &[u8], expires_at: u64) -> Vec<u8> {
         let mut msg = Vec::with_capacity(8 + payload.len());
         msg.extend_from_slice(&expires_at.to_be_bytes());
@@ -46,7 +56,7 @@ impl SignedToken {
         msg
     }
 
-    /// Serialize: `expires_at(8) || signature(64) || signer_key(32) || payload`.
+    /// Serializes the token: `expires_at(8) || signature(64) || signer_key(32) || payload`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(104 + self.payload.len());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
@@ -56,6 +66,7 @@ impl SignedToken {
         out
     }
 
+    /// Deserializes a token from bytes produced by [`to_bytes`](Self::to_bytes).
     pub fn from_bytes(data: &[u8]) -> Result<Self, TokenError> {
         const HEADER: usize = 8 + 64 + 32; // 104
         if data.len() < HEADER {
@@ -79,7 +90,7 @@ impl SignedToken {
     }
 }
 
-/// Create a signed token. `expires_at = 0` means no expiry.
+/// Creates an Ed25519-signed token. Set `expires_at = 0` for no expiry.
 pub fn create_signed_token(
     signing_key: &SigningKey,
     payload: &[u8],
@@ -97,15 +108,15 @@ pub fn create_signed_token(
     }
 }
 
-/// Verify signature and expiry. `now` is the current unix timestamp.
+/// Verifies signature and expiry of a [`SignedToken`].
 ///
+/// `now` is the current unix timestamp in seconds.
 /// Returns the payload on success.
 pub fn verify_signed_token(
     verifying_key: &VerifyingKey,
     token: &SignedToken,
     now: u64,
 ) -> Result<Vec<u8>, TokenError> {
-    // expiry check
     if token.expires_at > 0 && now > token.expires_at {
         return Err(TokenError::Expired);
     }

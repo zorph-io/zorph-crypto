@@ -1,9 +1,17 @@
+//! Key derivation, recovery phrases, and secure key management.
+//!
+//! Provides Argon2id-based key derivation with tunable parameters,
+//! BIP39-compatible 24-word recovery phrases (using BLAKE3 for checksums),
+//! password hashing/verification in PHC string format, and a zeroize-on-drop
+//! [`SecretKey`] wrapper.
+
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use rand::RngCore;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+/// Errors returned by key derivation and recovery operations.
 #[derive(Debug, Error)]
 pub enum KeyError {
     #[error("key derivation failed: {0}")]
@@ -12,18 +20,21 @@ pub enum KeyError {
     InvalidRecovery(String),
 }
 
-// Argon2id parameters — pick based on deployment target
+/// Tunable Argon2id parameters for key derivation and password hashing.
 #[derive(Debug, Clone, Copy)]
 pub struct Argon2Params {
-    pub memory_kib: u32,   // memory cost in KiB
-    pub iterations: u32,   // time cost
-    pub parallelism: u32,  // thread count
+    /// Memory cost in KiB.
+    pub memory_kib: u32,
+    /// Time cost (number of iterations).
+    pub iterations: u32,
+    /// Degree of parallelism (thread count).
+    pub parallelism: u32,
 }
 
 impl Argon2Params {
-    // server-side: 64MB, 3 iterations, 4 threads — good baseline for backend services
+    /// Server-side preset: 64 MiB, 3 iterations, 4 threads.
     pub const SERVER: Self = Self { memory_kib: 65536, iterations: 3, parallelism: 4 };
-    // interactive: 19MB, 2 iterations, 1 thread — responsive on laptops/mobile
+    /// Interactive preset: 19 MiB, 2 iterations, 1 thread — responsive on laptops/mobile.
     pub const INTERACTIVE: Self = Self { memory_kib: 19456, iterations: 2, parallelism: 1 };
 }
 
@@ -33,11 +44,12 @@ impl Default for Argon2Params {
     }
 }
 
-// Argon2id with SERVER preset (64MB, 3 iterations, 4 threads) -> 32-byte key
+/// Derives a 32-byte key from `password` and `salt` using Argon2id with [`Argon2Params::SERVER`].
 pub fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], KeyError> {
     derive_key_with_params(password, salt, Argon2Params::SERVER)
 }
 
+/// Derives a 32-byte key from `password` and `salt` using Argon2id with custom parameters.
 pub fn derive_key_with_params(
     password: &[u8],
     salt: &[u8],
@@ -54,10 +66,12 @@ pub fn derive_key_with_params(
     Ok(key)
 }
 
-// BIP39 English, 2048 words — embedded at compile time
+/// BIP39 English wordlist (2048 words), embedded at compile time.
 const WORDLIST: &[&str] = &include!("wordlist.txt");
 
-// 256 bits of entropy -> 24 words (+ 8-bit checksum = 264 bits = 24 x 11)
+/// Generates a 24-word BIP39 recovery phrase from 256 bits of OS entropy.
+///
+/// The phrase includes an 8-bit BLAKE3 checksum (264 bits = 24 × 11).
 pub fn generate_recovery() -> Vec<String> {
     let mut entropy = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut entropy);
@@ -67,7 +81,9 @@ pub fn generate_recovery() -> Vec<String> {
     words
 }
 
-// 24 words -> 32-byte key with checksum verification
+/// Recovers a 32-byte key from a 24-word BIP39 recovery phrase.
+///
+/// Verifies the embedded BLAKE3 checksum before returning.
 pub fn from_recovery(words: &[String]) -> Result<[u8; 32], KeyError> {
     if words.len() != 24 {
         return Err(KeyError::InvalidRecovery(format!(
@@ -132,56 +148,63 @@ fn entropy_to_words(entropy: &[u8; 32]) -> Vec<String> {
         .collect()
 }
 
-// BIP39 uses SHA-256, we use BLAKE3 for consistency within Zorph
+/// Returns the first byte of the BLAKE3 hash of `data`.
+///
+/// BIP39 uses SHA-256 for checksums; Zorph uses BLAKE3 for internal consistency.
 fn sha256_first_byte(data: &[u8]) -> u8 {
     let h = blake3::hash(data);
     h.as_bytes()[0]
 }
 
-// cryptographically secure random bytes from OS RNG
+/// Generates `N` cryptographically secure random bytes from the OS CSPRNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     buf
 }
 
+/// Generates `len` cryptographically secure random bytes as a [`Vec<u8>`].
 pub fn random_bytes_vec(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     buf
 }
 
-// BLAKE3 KDF — derives a subkey from a secret with domain separation
-// context must be a unique string per use case,
-// e.g. "zorph-crypto file-encryption-key v1"
+/// Derives a 32-byte subkey from input keying material using BLAKE3 KDF with domain separation.
+///
+/// `context` must be a globally unique string per use case,
+/// e.g. `"zorph-crypto file-encryption-key v1"`.
 pub fn derive_subkey(ikm: &[u8], context: &str) -> [u8; 32] {
     blake3::derive_key(context, ikm)
 }
 
-// Zeroed on drop — so the key doesn't linger in memory
+/// A 32-byte secret key that is zeroed on drop.
 #[derive(Zeroize)]
 #[zeroize(drop)]
 pub struct SecretKey(pub [u8; 32]);
 
 impl SecretKey {
+    /// Derives a [`SecretKey`] from a password and salt using Argon2id with server-side parameters.
     pub fn from_password(password: &[u8], salt: &[u8]) -> Result<Self, KeyError> {
         derive_key(password, salt).map(SecretKey)
     }
 
+    /// Returns the raw 32-byte key material.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
-// Password hashing — Argon2id in standard PHC string format.
-// Use for storing/verifying passwords, not for key derivation.
-
-/// Hash a password for storage. Returns a PHC-format string
-/// (e.g. `$argon2id$v=19$m=65536,t=3,p=4$salt$hash`).
+/// Hashes a password for storage using Argon2id with [`Argon2Params::SERVER`].
+///
+/// Returns a PHC-format string (e.g. `$argon2id$v=19$m=65536,t=3,p=4$salt$hash`).
 pub fn hash_password(password: &[u8]) -> Result<String, KeyError> {
     hash_password_with_params(password, Argon2Params::SERVER)
 }
 
+/// Hashes a password for storage using Argon2id with custom parameters.
+///
+/// Returns a PHC-format string.
 pub fn hash_password_with_params(
     password: &[u8],
     kdf_params: Argon2Params,
@@ -204,12 +227,13 @@ pub fn hash_password_with_params(
     Ok(hash.to_string())
 }
 
-/// Verify a password against a PHC-format hash string (constant-time).
+/// Verifies a password against a PHC-format hash string.
+///
+/// Comparison is constant-time. Parameters are read from the hash itself.
 pub fn verify_password(password: &[u8], hash_str: &str) -> Result<bool, KeyError> {
     let hash = argon2::PasswordHash::new(hash_str)
         .map_err(|e| KeyError::Derivation(e.to_string()))?;
 
-    // params are embedded in the hash — Argon2::default() delegates to them
     let argon2 = Argon2::default();
     Ok(argon2.verify_password(password, &hash).is_ok())
 }

@@ -1,11 +1,15 @@
-// AMD SEV-SNP attestation report verification + certificate chain.
-// Full chain: AMD Root Key (ARK) -> ASK -> VCEK -> attestation report.
+//! AMD SEV-SNP attestation report verification and certificate chain validation.
+//!
+//! Verifies the full AMD trust chain: ARK (root) → ASK → VCEK → attestation report.
+//! The attestation report confirms that code is running inside a genuine SEV-SNP enclave
+//! with the expected measurement. Nonce verification provides replay protection.
 
 use ecdsa::signature::Verifier;
 use p384::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Errors returned by attestation verification.
 #[derive(Debug, Error)]
 pub enum AttestError {
     #[error("attestation signature verification failed")]
@@ -22,32 +26,41 @@ pub enum AttestError {
     CertChainInvalid(String),
 }
 
-// SEV-SNP attestation report v2
-// measurement — hash of enclave code, report_data — client nonce (anti-replay)
+/// SEV-SNP attestation report (version 2).
+///
+/// `measurement` is the hash of the enclave code image.
+/// `report_data` carries a client-supplied nonce for replay protection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationReport {
     pub version: u32,
     pub guest_svn: u32,
     pub policy: u64,
+    /// Hash of the enclave code image (48 bytes for SEV-SNP).
     pub measurement: Vec<u8>,
+    /// Client-supplied nonce for anti-replay (64 bytes).
     pub report_data: Vec<u8>,
+    /// Data covered by the signature.
     pub signed_data: Vec<u8>,
+    /// ECDSA-P384 signature over `signed_data`.
     pub signature: Vec<u8>,
 }
 
-// VCEK — per-chip key, signed by the AMD chain (ARK -> ASK -> VCEK)
+/// VCEK (Versioned Chip Endorsement Key) — a per-chip ECDSA-P384 key
+/// signed by the AMD certificate chain (ARK → ASK → VCEK).
 #[derive(Debug, Clone)]
 pub struct VcekPublicKey {
     inner: VerifyingKey,
 }
 
 impl VcekPublicKey {
+    /// Parses a VCEK public key from SEC1-encoded bytes.
     pub fn from_sec1_bytes(bytes: &[u8]) -> Result<Self, AttestError> {
         let inner = VerifyingKey::from_sec1_bytes(bytes)
             .map_err(|e| AttestError::InvalidVcek(e.to_string()))?;
         Ok(Self { inner })
     }
 
+    /// Parses a VCEK public key from DER-encoded bytes.
     pub fn from_public_key_der(der: &[u8]) -> Result<Self, AttestError> {
         let inner = VerifyingKey::from_sec1_bytes(der)
             .map_err(|e| AttestError::InvalidVcek(e.to_string()))?;
@@ -55,9 +68,12 @@ impl VcekPublicKey {
     }
 }
 
-// 1. version must be 2
-// 2. ECDSA-P384 signature from VCEK
-// 3. measurement matches expected value (constant-time)
+/// Verifies an SEV-SNP attestation report.
+///
+/// Checks:
+/// 1. Report version must be 2.
+/// 2. ECDSA-P384 signature from the VCEK key.
+/// 3. Measurement matches `expected_measurement` (constant-time comparison).
 pub fn verify_attestation(
     report: &AttestationReport,
     vcek: &VcekPublicKey,
@@ -85,7 +101,9 @@ pub fn verify_attestation(
     Ok(())
 }
 
-// verifies nonce in report_data — replay attack protection
+/// Verifies that the report's nonce matches the expected value (constant-time).
+///
+/// Prevents replay attacks by binding the report to a client-generated challenge.
 pub fn verify_report_nonce(
     report: &AttestationReport,
     expected_nonce: &[u8; 64],
@@ -94,9 +112,10 @@ pub fn verify_report_nonce(
     report.report_data.as_slice().ct_eq(expected_nonce.as_slice()).into()
 }
 
-// Full AMD certificate chain verification: ARK -> ASK -> VCEK.
-// Input: three DER-encoded X.509 certificates.
-// Returns VCEK public key ready for verify_attestation().
+/// Verifies the full AMD certificate chain: ARK → ASK → VCEK.
+///
+/// Accepts three DER-encoded X.509 certificates and returns the VCEK public key
+/// ready for use with [`verify_attestation`].
 pub fn verify_cert_chain(
     ark_der: &[u8],
     ask_der: &[u8],
@@ -127,7 +146,7 @@ pub fn verify_cert_chain(
     VcekPublicKey::from_sec1_bytes(vcek_pk)
 }
 
-// verifies ECDSA-P384 signature of an X.509 certificate using the issuer's key
+/// Verifies an ECDSA-P384 signature on an X.509 certificate using the issuer's public key.
 fn verify_x509_p384(
     cert: &x509_cert::Certificate,
     issuer: &x509_cert::Certificate,
