@@ -1,4 +1,8 @@
-use zorph_crypto::keys::{derive_key, derive_subkey, SecretKey, generate_recovery, from_recovery};
+use zorph_crypto::keys::{
+    derive_key, derive_key_with_params, derive_subkey,
+    SecretKey, generate_recovery, from_recovery,
+    random_bytes, random_bytes_vec, Argon2Params,
+};
 
 #[test]
 fn derive_key_deterministic() {
@@ -74,4 +78,63 @@ fn derive_subkey_different_secrets() {
     let k1 = derive_subkey(b"secret-a", "same context");
     let k2 = derive_subkey(b"secret-b", "same context");
     assert_ne!(k1, k2);
+}
+
+// configurable Argon2 params
+
+#[test]
+fn derive_key_interactive_params() {
+    let k = derive_key_with_params(b"password", b"saltsalt", Argon2Params::INTERACTIVE).unwrap();
+    assert_eq!(k.len(), 32);
+    assert_ne!(k, [0u8; 32]);
+}
+
+#[test]
+fn derive_key_server_matches_default() {
+    let k1 = derive_key(b"password", b"saltsalt").unwrap();
+    let k2 = derive_key_with_params(b"password", b"saltsalt", Argon2Params::SERVER).unwrap();
+    assert_eq!(k1, k2);
+}
+
+#[test]
+fn derive_key_different_params_different_keys() {
+    let k1 = derive_key_with_params(b"password", b"saltsalt", Argon2Params::SERVER).unwrap();
+    let k2 = derive_key_with_params(b"password", b"saltsalt", Argon2Params::INTERACTIVE).unwrap();
+    assert_ne!(k1, k2);
+}
+
+#[test]
+fn derive_key_custom_params() {
+    let params = Argon2Params { memory_kib: 8192, iterations: 1, parallelism: 1 };
+    let k = derive_key_with_params(b"pass", b"saltsalt", params).unwrap();
+    assert_eq!(k.len(), 32);
+}
+
+// random bytes
+
+#[test]
+fn random_bytes_32() {
+    let a: [u8; 32] = random_bytes();
+    let b: [u8; 32] = random_bytes();
+    assert_ne!(a, b);
+    assert_eq!(a.len(), 32);
+}
+
+#[test]
+fn random_bytes_16() {
+    let a: [u8; 16] = random_bytes();
+    assert_eq!(a.len(), 16);
+}
+
+#[test]
+fn random_bytes_vec_length() {
+    let v = random_bytes_vec(64);
+    assert_eq!(v.len(), 64);
+}
+
+#[test]
+fn random_bytes_vec_not_zero() {
+    let v = random_bytes_vec(32);
+    // statistically impossible for 32 random bytes to all be zero
+    assert!(v.iter().any(|&b| b != 0));
 }

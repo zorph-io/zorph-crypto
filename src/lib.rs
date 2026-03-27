@@ -9,3 +9,4 @@ pub mod pqc;
 pub mod attest;
 pub mod zk;
 pub mod wipe;
+pub mod token;

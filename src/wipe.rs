@@ -63,3 +63,21 @@ impl AsMut<[u8]> for SecureBuffer {
         &mut self.inner
     }
 }
+
+impl From<Vec<u8>> for SecureBuffer {
+    fn from(data: Vec<u8>) -> Self {
+        Self { inner: data }
+    }
+}
+
+impl From<String> for SecureBuffer {
+    fn from(s: String) -> Self {
+        Self { inner: s.into_bytes() }
+    }
+}
+
+impl From<&[u8]> for SecureBuffer {
+    fn from(data: &[u8]) -> Self {
+        Self { inner: data.to_vec() }
+    }
+}

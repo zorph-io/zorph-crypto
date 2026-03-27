@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use zorph_crypto::{encrypt, hash, keys, pqc, sign, exchange};
+use zorph_crypto::{encrypt, hash, keys, pqc, sign, exchange, multisig, zk};
 
 fn bench_encrypt(c: &mut Criterion) {
     let key = [0x42u8; 32];
@@ -114,11 +114,85 @@ fn bench_slh_dsa_verify(c: &mut Criterion) {
     });
 }
 
+fn bench_streaming_encrypt(c: &mut Criterion) {
+    let key = [0x42u8; 32];
+    let chunk = vec![0u8; 64 * 1024]; // 64KB chunks
+    c.bench_function("stream_seal_64kb_aes", |b| {
+        b.iter(|| {
+            let (mut sealer, _header) = encrypt::StreamSealer::new(&key, encrypt::Cipher::Aes256Gcm);
+            sealer.seal_chunk(black_box(&chunk)).unwrap()
+        })
+    });
+}
+
+fn bench_envelope_encrypt(c: &mut Criterion) {
+    let kek = [0x42u8; 32];
+    let data = vec![0u8; 1024];
+    c.bench_function("envelope_seal_1kb", |b| {
+        b.iter(|| {
+            encrypt::envelope_seal(black_box(&kek), black_box(&data), encrypt::Cipher::Aes256Gcm)
+                .unwrap()
+        })
+    });
+}
+
+fn bench_hash_64kb(c: &mut Criterion) {
+    let data = vec![0u8; 64 * 1024];
+    c.bench_function("blake3_hash_64kb", |b| {
+        b.iter(|| hash::hash(black_box(&data)))
+    });
+}
+
+fn bench_streaming_hash(c: &mut Criterion) {
+    let chunks: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; 4096]).collect();
+    c.bench_function("blake3_streaming_64kb", |b| {
+        b.iter(|| {
+            let mut hasher = hash::Hasher::new();
+            for chunk in &chunks {
+                hasher.update(black_box(chunk));
+            }
+            hasher.finalize()
+        })
+    });
+}
+
+fn bench_multisig_verify(c: &mut Criterion) {
+    let msg = b"benchmark multisig";
+    let (sk1, _) = sign::generate_keypair();
+    let (sk2, _) = sign::generate_keypair();
+    let (sk3, _) = sign::generate_keypair();
+    let sigs = multisig::create_multisig(msg, &[&sk1, &sk2, &sk3]);
+    c.bench_function("multisig_verify_3of3", |b| {
+        b.iter(|| multisig::verify_multisig(black_box(msg), black_box(&sigs), 3).unwrap())
+    });
+}
+
+fn bench_merkle_prove(c: &mut Criterion) {
+    let leaves: Vec<[u8; 32]> = (0..1024u32)
+        .map(|i| hash::hash(&i.to_le_bytes()))
+        .collect();
+    c.bench_function("merkle_prove_1024_leaves", |b| {
+        b.iter(|| zk::merkle_prove(black_box(&leaves), 500).unwrap())
+    });
+}
+
+fn bench_merkle_verify(c: &mut Criterion) {
+    let leaves: Vec<[u8; 32]> = (0..1024u32)
+        .map(|i| hash::hash(&i.to_le_bytes()))
+        .collect();
+    let proof = zk::merkle_prove(&leaves, 500).unwrap();
+    c.bench_function("merkle_verify_1024_leaves", |b| {
+        b.iter(|| zk::merkle_verify(black_box(&proof)).unwrap())
+    });
+}
+
 criterion_group!(
     benches,
     bench_encrypt,
     bench_chacha20_encrypt,
     bench_hash,
+    bench_hash_64kb,
+    bench_streaming_hash,
     bench_derive_key,
     bench_ed25519_sign,
     bench_ed25519_verify,
@@ -129,5 +203,10 @@ criterion_group!(
     bench_hybrid_exchange,
     bench_slh_dsa_sign,
     bench_slh_dsa_verify,
+    bench_streaming_encrypt,
+    bench_envelope_encrypt,
+    bench_multisig_verify,
+    bench_merkle_prove,
+    bench_merkle_verify,
 );
 criterion_main!(benches);

@@ -1,6 +1,8 @@
 use zorph_crypto::encrypt::{
     encrypt, decrypt, seal, open, seal_aad, open_aad,
     envelope_seal, envelope_open, envelope_seal_aad, envelope_open_aad,
+    envelope_rotate,
+    versioned_seal, versioned_open, versioned_seal_aad, versioned_open_aad,
     Cipher, StreamSealer, StreamOpener,
 };
 
@@ -256,4 +258,97 @@ fn envelope_aad_wrong_aad_fails() {
 fn envelope_too_short_fails() {
     let kek = [0x42u8; 32];
     assert!(envelope_open(&kek, &[0u8; 3]).is_err());
+}
+
+// Versioned seal/open
+
+#[test]
+fn versioned_seal_open_roundtrip() {
+    let key = [0x42u8; 32];
+    let plaintext = b"versioned data";
+    let ct = versioned_seal(&key, plaintext, Cipher::Aes256Gcm).unwrap();
+    assert_eq!(ct[0], 0x01); // version byte
+    let pt = versioned_open(&key, &ct).unwrap();
+    assert_eq!(pt, plaintext);
+}
+
+#[test]
+fn versioned_seal_open_chacha() {
+    let key = [0x42u8; 32];
+    let ct = versioned_seal(&key, b"chacha versioned", Cipher::ChaCha20Poly1305).unwrap();
+    let pt = versioned_open(&key, &ct).unwrap();
+    assert_eq!(pt, b"chacha versioned");
+}
+
+#[test]
+fn versioned_seal_open_aad() {
+    let key = [0x42u8; 32];
+    let aad = b"file_id:v1";
+    let ct = versioned_seal_aad(&key, b"data", aad, Cipher::Aes256Gcm).unwrap();
+    let pt = versioned_open_aad(&key, &ct, aad).unwrap();
+    assert_eq!(pt, b"data");
+}
+
+#[test]
+fn versioned_open_wrong_version_fails() {
+    let key = [0x42u8; 32];
+    let mut ct = versioned_seal(&key, b"data", Cipher::Aes256Gcm).unwrap();
+    ct[0] = 0xFF; // bogus version
+    assert!(versioned_open(&key, &ct).is_err());
+}
+
+#[test]
+fn versioned_open_empty_fails() {
+    let key = [0x42u8; 32];
+    assert!(versioned_open(&key, &[]).is_err());
+}
+
+#[test]
+fn versioned_open_wrong_key_fails() {
+    let key = [0x42u8; 32];
+    let wrong = [0x00u8; 32];
+    let ct = versioned_seal(&key, b"secret", Cipher::Aes256Gcm).unwrap();
+    assert!(versioned_open(&wrong, &ct).is_err());
+}
+
+// --- envelope_rotate ---
+
+#[test]
+fn envelope_rotate_aes() {
+    let old_kek = [0x11u8; 32];
+    let new_kek = [0x22u8; 32];
+    let plaintext = b"rotate me";
+
+    let sealed = envelope_seal(&old_kek, plaintext, Cipher::Aes256Gcm).unwrap();
+    let rotated = envelope_rotate(&old_kek, &new_kek, &sealed).unwrap();
+
+    // old key no longer works
+    assert!(envelope_open(&old_kek, &rotated).is_err());
+    // new key decrypts correctly
+    let recovered = envelope_open(&new_kek, &rotated).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn envelope_rotate_chacha() {
+    let old_kek = [0x33u8; 32];
+    let new_kek = [0x44u8; 32];
+    let plaintext = b"chacha rotate";
+
+    let sealed = envelope_seal(&old_kek, plaintext, Cipher::ChaCha20Poly1305).unwrap();
+    let rotated = envelope_rotate(&old_kek, &new_kek, &sealed).unwrap();
+
+    assert!(envelope_open(&old_kek, &rotated).is_err());
+    let recovered = envelope_open(&new_kek, &rotated).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn envelope_rotate_wrong_old_key_fails() {
+    let real_kek = [0x55u8; 32];
+    let wrong_kek = [0x66u8; 32];
+    let new_kek = [0x77u8; 32];
+
+    let sealed = envelope_seal(&real_kek, b"data", Cipher::Aes256Gcm).unwrap();
+    assert!(envelope_rotate(&wrong_kek, &new_kek, &sealed).is_err());
 }

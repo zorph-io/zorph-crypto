@@ -92,8 +92,9 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
             if chunk.len() == 2 {
                 next.push(hash_pair(&chunk[0], &chunk[1]));
             } else {
-                // odd leaf — promoted to the next level as-is
-                next.push(chunk[0]);
+                // odd leaf — duplicate it so the tree is always balanced.
+                // prevents cross-tree root collisions.
+                next.push(hash_pair(&chunk[0], &chunk[0]));
             }
         }
         current = next;
@@ -129,6 +130,12 @@ pub fn merkle_prove(leaves: &[[u8; 32]], index: usize) -> Result<MerkleProof, Zk
                 hash: current[sibling_idx],
                 is_left: idx % 2 == 1,
             });
+        } else {
+            // odd leaf — sibling is itself (duplication)
+            path.push(MerkleNode {
+                hash: current[idx],
+                is_left: false,
+            });
         }
 
         let mut next = Vec::with_capacity((current.len() + 1) / 2);
@@ -136,7 +143,7 @@ pub fn merkle_prove(leaves: &[[u8; 32]], index: usize) -> Result<MerkleProof, Zk
             if chunk.len() == 2 {
                 next.push(hash_pair(&chunk[0], &chunk[1]));
             } else {
-                next.push(chunk[0]);
+                next.push(hash_pair(&chunk[0], &chunk[0]));
             }
         }
         current = next;

@@ -49,3 +49,30 @@ fn secure_buffer_as_ref() {
     let r: &[u8] = buf.as_ref();
     assert_eq!(r, &[42]);
 }
+
+#[test]
+fn secure_buffer_from_string() {
+    let buf: SecureBuffer = String::from("secret password").into();
+    assert_eq!(buf.as_bytes(), b"secret password");
+}
+
+#[test]
+fn secure_buffer_from_vec() {
+    let buf: SecureBuffer = vec![1u8, 2, 3].into();
+    assert_eq!(buf.as_bytes(), &[1, 2, 3]);
+}
+
+#[test]
+fn secure_buffer_from_byte_slice() {
+    let data: &[u8] = &[10, 20, 30];
+    let buf: SecureBuffer = data.into();
+    assert_eq!(buf.as_bytes(), &[10, 20, 30]);
+}
+
+#[test]
+fn secure_buffer_as_mut() {
+    let mut buf = SecureBuffer::new(vec![1, 2, 3]);
+    let m: &mut [u8] = buf.as_mut();
+    m[0] = 99;
+    assert_eq!(buf.as_bytes(), &[99, 2, 3]);
+}

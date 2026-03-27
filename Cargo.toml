@@ -10,10 +10,7 @@ homepage = "https://zorph.io"
 documentation = "https://docs.zorph.io"
 keywords = ["cryptography", "security", "post-quantum", "hybrid"]
 categories = ["cryptography", "security"]
-license-file = "LICENSE"
 readme = "README.md"
-repository-file = "Cargo.toml"
-repository-url = "https://github.com/zorph-io/zorph-crypto"
 
 [dependencies]
 # === КЛАССИКА (проверенная, быстрая) ===

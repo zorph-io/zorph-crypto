@@ -17,7 +17,8 @@
       "Bash(/tmp/find_conversions.sh:*)",
       "Bash(chmod +x /tmp/find_conversions.sh)",
       "Bash(/tmp/find_conversions.sh)",
-      "Bash(cargo bench:*)"
+      "Bash(cargo bench:*)",
+      "Bash(cargo run:*)"
     ]
   }
 }

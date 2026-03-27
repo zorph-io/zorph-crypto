@@ -21,16 +21,26 @@ pub fn create_multisig(
         .collect()
 }
 
-// verifies that at least `threshold` signatures are valid
+// verifies that at least `threshold` unique signatures are valid.
+// deduplicates by public key — same key can't be counted twice.
 pub fn verify_multisig(
     message: &[u8],
     signatures: &[(VerifyingKey, Signature)],
     threshold: usize,
 ) -> Result<(), MultisigError> {
-    let valid = signatures
-        .iter()
-        .filter(|(pk, sig)| pk.verify(message, sig).is_ok())
-        .count();
+    let mut seen_keys = Vec::with_capacity(signatures.len());
+    let mut valid = 0usize;
+
+    for (pk, sig) in signatures {
+        let pk_bytes = pk.to_bytes();
+        if seen_keys.contains(&pk_bytes) {
+            continue;
+        }
+        if pk.verify(message, sig).is_ok() {
+            seen_keys.push(pk_bytes);
+            valid += 1;
+        }
+    }
 
     if valid >= threshold {
         Ok(())

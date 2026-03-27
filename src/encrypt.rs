@@ -19,6 +19,8 @@ pub enum EncryptError {
     NonceOverflow,
     #[error("invalid stream header")]
     InvalidHeader,
+    #[error("unsupported format version: {0}")]
+    UnsupportedVersion(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,10 @@ const TAG_AES: u8 = 0x01;
 const TAG_CHACHA: u8 = 0x02;
 const NONCE_PREFIX_LEN: usize = 8;
 const STREAM_HEADER_LEN: usize = 1 + NONCE_PREFIX_LEN;
+
+// format version — prepended by versioned_seal/versioned_open.
+// allows future format changes without breaking old data.
+const FORMAT_VERSION: u8 = 0x01;
 
 // Legacy API — AES-256-GCM only, format: nonce(12) || ciphertext
 
@@ -361,4 +367,100 @@ pub fn envelope_open_aad(
 
     dek.zeroize();
     Ok(plaintext)
+}
+
+// Key rotation — re-wraps the DEK with a new KEK without touching the data.
+// Only the wrapped-DEK portion changes; the encrypted payload stays identical.
+
+pub fn envelope_rotate(
+    old_kek: &[u8; 32],
+    new_kek: &[u8; 32],
+    data: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    envelope_rotate_aad(old_kek, new_kek, data, &[])
+}
+
+pub fn envelope_rotate_aad(
+    old_kek: &[u8; 32],
+    new_kek: &[u8; 32],
+    data: &[u8],
+    _aad: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    if data.len() < 4 {
+        return Err(EncryptError::TooShort);
+    }
+
+    let wdk_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < 4 + wdk_len {
+        return Err(EncryptError::TooShort);
+    }
+
+    let wrapped_dek = &data[4..4 + wdk_len];
+    let encrypted_data = &data[4 + wdk_len..];
+
+    // unwrap DEK with old KEK (binding = blake3 of encrypted payload)
+    let binding = blake3::hash(encrypted_data);
+    let mut dek_bytes = open_aad(old_kek, wrapped_dek, binding.as_bytes())?;
+
+    // detect cipher from the original wrapped-DEK tag
+    let cipher = match wrapped_dek.first() {
+        Some(&TAG_AES) => Cipher::Aes256Gcm,
+        Some(&TAG_CHACHA) => Cipher::ChaCha20Poly1305,
+        _ => return Err(EncryptError::Decrypt),
+    };
+
+    // re-wrap DEK with new KEK (same binding)
+    let new_wrapped_dek = seal_aad(new_kek, &dek_bytes, binding.as_bytes(), cipher)?;
+    dek_bytes.zeroize();
+
+    // reassemble envelope
+    let len = (new_wrapped_dek.len() as u32).to_le_bytes();
+    let mut out = Vec::with_capacity(4 + new_wrapped_dek.len() + encrypted_data.len());
+    out.extend_from_slice(&len);
+    out.extend_from_slice(&new_wrapped_dek);
+    out.extend_from_slice(encrypted_data);
+    Ok(out)
+}
+
+// Versioned seal/open — format: version(1) || seal_payload
+// Allows future format upgrades while keeping old data readable.
+// Current version: 0x01
+
+pub fn versioned_seal(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    cipher: Cipher,
+) -> Result<Vec<u8>, EncryptError> {
+    versioned_seal_aad(key, plaintext, &[], cipher)
+}
+
+pub fn versioned_open(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, EncryptError> {
+    versioned_open_aad(key, data, &[])
+}
+
+pub fn versioned_seal_aad(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+    cipher: Cipher,
+) -> Result<Vec<u8>, EncryptError> {
+    let inner = seal_aad(key, plaintext, aad, cipher)?;
+    let mut out = Vec::with_capacity(1 + inner.len());
+    out.push(FORMAT_VERSION);
+    out.extend_from_slice(&inner);
+    Ok(out)
+}
+
+pub fn versioned_open_aad(
+    key: &[u8; 32],
+    data: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    if data.is_empty() {
+        return Err(EncryptError::TooShort);
+    }
+    match data[0] {
+        FORMAT_VERSION => open_aad(key, &data[1..], aad),
+        _ => Err(EncryptError::UnsupportedVersion(data[0])),
+    }
 }
