@@ -1,0 +1,56 @@
+[package]
+name = "zorph-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cryptographic primitives for the Zorph platform"
+repository = "https://github.com/zorph-io/zorph-crypto"
+authors = ["Zorph Labs <support@zorph.io>"]
+homepage = "https://zorph.io"
+documentation = "https://docs.zorph.io"
+keywords = ["cryptography", "security", "post-quantum", "hybrid"]
+categories = ["cryptography", "security"]
+license-file = "LICENSE"
+readme = "README.md"
+repository-file = "Cargo.toml"
+repository-url = "https://github.com/zorph-io/zorph-crypto"
+
+[dependencies]
+# === КЛАССИКА (проверенная, быстрая) ===
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+blake3 = "1"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+# === POST-QUANTUM (NIST FIPS 203/204/205) ===
+ml-kem = "0.3.0-rc.1"
+ml-dsa = "0.1.0-rc.8"
+slh-dsa = "0.2.0-rc.4"
+
+# === ATTESTATION (SEV-SNP) ===
+p384 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["verifying"] }
+
+# === ATTESTATION CERT CHAIN ===
+x509-cert = "0.2"
+
+# === УТИЛИТЫ ===
+shamir = "2"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+getrandom = { version = "0.4", features = ["std", "sys_rng"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+serde_json = "1"
+rcgen = "0.13"
+
+[[bench]]
+name = "benchmark"
+harness = false

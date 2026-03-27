@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo test:*)",
+      "Bash(ls /Volumes/Dev/Zorph/zorph-crypto/src/**/*.rs)",
+      "Bash(cargo info:*)",
+      "Bash(cargo update:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(grep -r 'pub struct SysRng' /Users/deveus/.cargo/registry/src/index.crates.io-*/getrandom-*/src/)",
+      "Bash(grep:*)",
+      "Bash(/tmp/extract_info.sh:*)",
+      "Bash(chmod +x /tmp/extract_info.sh)",
+      "Bash(/tmp/extract_info.sh)",
+      "Bash(/tmp/ml_dsa_sizes.txt:*)",
+      "Bash(/tmp/find_conversions.sh:*)",
+      "Bash(chmod +x /tmp/find_conversions.sh)",
+      "Bash(/tmp/find_conversions.sh)",
+      "Bash(cargo bench:*)"
+    ]
+  }
+}
